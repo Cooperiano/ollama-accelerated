@@ -8,6 +8,93 @@
 
 Start building with open models.
 
+> ## 🔥 This Fork: PagedAttention + Continuous Batching
+>
+> `ollama-accelerated` adds a **PagedAttention KV cache** and a **continuous-batching scheduler** on top of upstream Ollama. KV data is stored in fixed-size, non-contiguous blocks referenced by block tables — the same idea behind vLLM — which reduces memory fragmentation and unlocks efficient dynamic batching of variable-length sequences.
+>
+> Jump to: [What changed](#what-changed) · [Architecture](#architecture) · [Performance](#performance-results) · [Build](#building-this-fork) · [Benchmarks](#benchmarking)
+
+### What changed
+
+This branch (`feature/paged-attention`) touches every layer of the stack, from the CUDA/Metal/CPU kernels up to the Go runner:
+
+| Layer | File(s) | Change |
+|-------|---------|--------|
+| **GGML op** | `ggml/include/ggml.h`, `ggml/src/ggml.c` | New `GGML_OP_PAGED_ATTENTION` op + `ggml_paged_attention_ext()` C API |
+| **CUDA kernel** | `ggml/src/ggml-cuda/pagedattn.{cu,cuh}`, `ggml-cuda.cu` | F32 attention kernel with online (incremental) softmax, GQA support, block-table traversal (F16 variant in progress) |
+| **Metal kernel** | `ggml/src/ggml-metal/*.metal,*.{cpp,h}` | Metal PagedAttention compute kernel + op registration |
+| **CPU kernel** | `ggml/src/ggml-cpu/ops.{cpp,h}`, `ggml-cpu.c` | Reference CPU PagedAttention implementation |
+| **ML bindings** | `ml/backend.go`, `ml/backend/ggml/ggml.go` | New `PagedAttention` Go interface + ggml backend binding |
+| **Attention path** | `ml/nn/attention.go` | Routes through `pagedAttention()` when the cache is a `*kvcache.Paged`, falls back to standard attention otherwise |
+| **KV cache** | `kvcache/paged.go` | Block-based KV cache: block tables, free-list, ref-counted allocation, scatter via `SetRows` |
+| **Scheduler** | `runner/ollamarunner/scheduler.go`, `runner.go` | `ContinuousBatchScheduler` with priority queue, preemption, per-batch token budgeting |
+| **Model glue** | `model/model.go`, `model/models/qwen3{,next}/model.go` | `SetCache`/`GetCache` accessors; `qwen35` registration moved from `qwen3next` → `qwen3` |
+
+Tests added: `paged_test.go`, `paged_bench_test.go`, `paged_e2e_test.go`, `paged_model_test.go`, `paged_vs_causal_bench_test.go`, `real_model_test.go` (≈2,000 lines of Go tests).
+
+### Architecture
+
+```
+ Request ──▶ runner ──▶ ContinuousBatchScheduler (priority queue, preemption)
+                           │
+                           ▼
+                     kvcache.Paged   (block tables, free-list, ref counts)
+                           │  Get() returns 4D [headDim, kvHeads, blockSize, numBlocks]
+                           ▼
+                ml/nn/attention.go  →  pagedAttention()
+                           │
+                           ▼
+              ml.PagedAttention interface  →  ggml backend binding
+                           │
+                           ▼
+        ggml_paged_attention_ext()  →  CUDA / Metal / CPU kernel
+        (online softmax over block tables, GQA-aware)
+```
+
+- **Block-based storage:** KV is a flat pool of `numBlocks × blockSize` blocks. Logical positions map to physical blocks via `block_tables`, so sequences are non-contiguous in memory — no padding waste, easy reuse on completion.
+- **Online softmax:** each block is accumulated with running max/sum correction, so attention is exact without materializing the full score matrix.
+- **F32 kernel (F16 WIP):** the CUDA path runs an F32 kernel today; an FP16 mixed-precision variant (half Q/K/V, FP32 softmax accumulation) is written but not yet built/validated.
+
+### Performance results
+
+Measured on RTX 3080, `mistral:latest` (7.2B, Q4_K_M), vs official Ollama v0.20.2. Full reports: [`PERFORMANCE_COMPARISON_REPORT.md`](PERFORMANCE_COMPARISON_REPORT.md), [`HIGH_CONCURRENCY_RESULTS.md`](HIGH_CONCURRENCY_RESULTS.md).
+
+| Scenario | Official (v0.20.2) | PagedAttention | Δ |
+|----------|--------------------|----------------|---|
+| Single-request TPS | 88.62 tok/s | 86.62 tok/s | −2.3% |
+| Single-request min latency | 2.33 s | 2.19 s | **−6.0%** |
+| High concurrency (4-way) | 88.36 tok/s | **90.87 tok/s** | +2.8% |
+| High concurrency (32-way) | 90.33 tok/s | 89.54 tok/s | −0.9% |
+| Mixed-length, long prompts | 15.9 tok/s | **16.5 tok/s** | **+3.8%** |
+
+**Takeaways:** single-request throughput is on par with FlashAttn (PagedAttention's win is memory efficiency, not per-token compute). Stability is identical — **0 failures across 480+ concurrent requests**. Long-sequence handling shows a small edge. Optimization roadmap (FP16 dispatch, vectorized loads, request-level batching) is in [`docs/PERFORMANCE_OPTIMIZATION_ANALYSIS.md`](docs/PERFORMANCE_OPTIMIZATION_ANALYSIS.md).
+
+### Building this fork
+
+```shell
+# Build the accelerated CLI
+go build -o ollama-paged .
+
+# Serve with the PagedAttention path
+./ollama-paged serve
+```
+
+The CUDA backend rebuilds `libggml-cuda.so` automatically via the ggml CMake build; the new `pagedattn.cu` is picked up from `ml/backend/ggml/ggml/src/ggml-cuda/`.
+
+### Benchmarking
+
+Reproducible comparison harnesses live in [`scripts/`](scripts/):
+
+```shell
+./scripts/benchmark_compare_official.sh       # end-to-end official vs paged
+go run ./scripts/benchmark_high_concurrency.go official   # then `paged`
+go run ./scripts/benchmark_mixed_length.go    official     # then `paged`
+```
+
+See [`docs/BENCHMARK_GUIDE.md`](docs/BENCHMARK_GUIDE.md) for the methodology and expected results.
+
+---
+
 ## Download
 
 ### macOS

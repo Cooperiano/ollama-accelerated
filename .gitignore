@@ -15,4 +15,12 @@ __debug_bin*
 llama/build
 llama/vendor
 /ollama
+# Built CLI and benchmark binaries (Go output, not source)
+/ollama-bench
+/ollama-custom
+/ollama-paged
+/scripts/benchmark_compare
+/scripts/benchmark_high_concurrency
+/scripts/benchmark_improved
+/scripts/benchmark_mixed_length
 integration/testdata/models/
