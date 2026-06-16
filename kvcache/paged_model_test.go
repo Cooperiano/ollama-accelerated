@@ -234,9 +234,14 @@ func runBlockSizeTest(t *testing.T, config ModelConfig, blockSize int) {
 
 	for layer := 0; layer < config.NumLayers; layer++ {
 		paged.SetLayer(layer)
-		ctx := backend.NewContext().Input()
 
 		for pos := 0; pos < testTokens; pos++ {
+			// Use a fresh context per token (matching real inference, where each
+			// forward pass builds its graph in a new context). Reusing a single
+			// context across all positions accumulates tensor metadata in its
+			// memory pool and exhausts it at small block sizes (more numBlocks).
+			ctx := backend.NewContext().Input()
+
 			paged.StartForward(ctx, input.Batch{
 				Sequences: []int{0},
 				Positions: []int32{int32(pos)},
@@ -250,9 +255,9 @@ func runBlockSizeTest(t *testing.T, config ModelConfig, blockSize int) {
 
 			paged.Put(ctx, key, value)
 			paged.Get(ctx)
-		}
 
-		ctx.Close()
+			ctx.Close()
+		}
 	}
 
 	duration := time.Since(start)

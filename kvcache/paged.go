@@ -251,8 +251,10 @@ func (p *Paged) StartForward(ctx ml.Context, batch input.Batch, reserve bool) er
 
 		blocks, exists := p.blockTables[seqID]
 		if !exists {
-			numTokens := int(maxSeqPos[seqID])
-			allocated, err := p.allocateBlocksForSequence(seqID, numTokens)
+			// Allocate for the full per-sequence capacity, not just the current position.
+			// This ensures the sequence has enough blocks for its entire lifetime.
+			perSeqCapacity := p.capacity / p.maxSequences
+			allocated, err := p.allocateBlocksForSequence(seqID, perSeqCapacity)
 			if err != nil {
 				return fmt.Errorf("failed to allocate blocks for sequence %d: %w", seqID, err)
 			}

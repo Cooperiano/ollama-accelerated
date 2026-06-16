@@ -411,29 +411,45 @@ func runConcurrentSessions(t *testing.T, usePaged bool, headDim, numKVHeads, num
 	totalTokens := 0
 
 	for sessionID := 0; sessionID < numSessions; sessionID++ {
-		for layer := 0; layer < numLayers; layer++ {
+		cache.SetLayer(0)
+		ctx := backend.NewContext().Input()
+		defer ctx.Close()
+
+		// Each session starts at position 0 and processes its first token
+		if err := cache.StartForward(ctx, input.Batch{
+			Sequences: []int{sessionID},
+			Positions: []int32{0},
+		}, false); err != nil {
+			t.Fatalf("session %d: %v", sessionID, err)
+		}
+
+		kvSize := headDim * numKVHeads * batchSize
+		keyData := make([]float32, kvSize)
+		valueData := make([]float32, kvSize)
+		key := ctx.FromFloats(keyData, headDim, numKVHeads, batchSize)
+		value := ctx.FromFloats(valueData, headDim, numKVHeads, batchSize)
+
+		cache.Put(ctx, key, value)
+		cache.Get(ctx)
+
+		totalTokens++
+
+		for layer := 1; layer < numLayers; layer++ {
 			cache.SetLayer(layer)
-			ctx := backend.NewContext().Input()
-			defer ctx.Close()
+			layerCtx := backend.NewContext().Input()
+			defer layerCtx.Close()
 
-			position := int32(sessionID * tokensPerSession)
-
-			if err := cache.StartForward(ctx, input.Batch{
+			if err := cache.StartForward(layerCtx, input.Batch{
 				Sequences: []int{sessionID},
-				Positions: []int32{position},
+				Positions: []int32{0},
 			}, false); err != nil {
 				t.Fatalf("layer %d session %d: %v", layer, sessionID, err)
 			}
 
-			kvSize := headDim * numKVHeads * batchSize
-			keyData := make([]float32, kvSize)
-			valueData := make([]float32, kvSize)
-			key := ctx.FromFloats(keyData, headDim, numKVHeads, batchSize)
-			value := ctx.FromFloats(valueData, headDim, numKVHeads, batchSize)
-
-			cache.Put(ctx, key, value)
-			cache.Get(ctx)
-
+			layerKey := layerCtx.FromFloats(keyData, headDim, numKVHeads, batchSize)
+			layerValue := layerCtx.FromFloats(valueData, headDim, numKVHeads, batchSize)
+			cache.Put(layerCtx, layerKey, layerValue)
+			cache.Get(layerCtx)
 			totalTokens++
 		}
 	}
