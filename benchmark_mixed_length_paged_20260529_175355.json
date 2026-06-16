@@ -1,0 +1,17 @@
+{
+  "Label": "paged",
+  "TotalRequests": 60,
+  "SuccessCount": 60,
+  "FailureCount": 0,
+  "TotalTime": 249331184403,
+  "ShortCount": 30,
+  "ShortAvgTokens": 217.06666666666666,
+  "ShortAvgLatency": 28485506166,
+  "MediumCount": 20,
+  "MediumAvgTokens": 380.15,
+  "MediumAvgLatency": 31005814237,
+  "LongCount": 10,
+  "LongAvgTokens": 607.8,
+  "LongAvgLatency": 36831877467,
+  "OverallThroughput": 80.9886659318217
+}

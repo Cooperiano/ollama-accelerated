@@ -8726,6 +8726,528 @@ void ggml_compute_forward_flash_attn_back(
     }
 }
 
+// ============================================================================
+// PagedAttention SIMD-optimized helper functions
+// ============================================================================
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+
+// AVX2 dot product: compute dot(x, y) for n elements
+static inline float ggml_dot_product_avx2(const float * GGML_RESTRICT x, const float * GGML_RESTRICT y, int n) {
+    __m256 sum = _mm256_setzero_ps();
+    int i = 0;
+    // Process 8 elements at a time
+    for (; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vy = _mm256_loadu_ps(y + i);
+        sum = _mm256_fmadd_ps(vx, vy, sum);  // sum += x * y
+    }
+    // Horizontal sum
+    float tmp[8];
+    _mm256_storeu_ps(tmp, sum);
+    float result = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        result += x[i] * y[i];
+    }
+    return result;
+}
+
+// AVX2 fused multiply-add: dst += alpha * src
+static inline void ggml_vec_mad_avx2(float * GGML_RESTRICT dst, const float * GGML_RESTRICT src, float alpha, int n) {
+    int i = 0;
+    __m256 valpha = _mm256_set1_ps(alpha);
+    for (; i + 8 <= n; i += 8) {
+        __m256 vsrc = _mm256_loadu_ps(src + i);
+        __m256 vdst = _mm256_loadu_ps(dst + i);
+        vdst = _mm256_fmadd_ps(vsrc, valpha, vdst);  // dst += alpha * src
+        _mm256_storeu_ps(dst + i, vdst);
+    }
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        dst[i] += alpha * src[i];
+    }
+}
+
+// AVX2 incremental softmax: find max in a block
+static inline float ggml_reduce_max_avx2(const float * x, int n) {
+    if (n == 0) return -INFINITY;
+    __m256 vmax = _mm256_set1_ps(x[0]);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        vmax = _mm256_max_ps(vmax, vx);
+    }
+    // Horizontal max
+    float tmp[8];
+    _mm256_storeu_ps(tmp, vmax);
+    float result = tmp[0];
+    for (int j = 1; j < 8; ++j) {
+        result = result > tmp[j] ? result : tmp[j];
+    }
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        result = result > x[i] ? result : x[i];
+    }
+    return result;
+}
+
+#define GGML_USE_SIMD_DOT_PRODUCT 1
+#define GGML_USE_SIMD_MAD 1
+#define GGML_USE_SIMD_REDUCE_MAX 1
+
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+
+// NEON dot product
+static inline float ggml_dot_product_neon(const float * GGML_RESTRICT x, const float * GGML_RESTRICT y, int n) {
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    // Process 8 elements at a time (2 NEON registers)
+    for (; i + 8 <= n; i += 8) {
+        float32x4_t vx0 = vld1q_f32(x + i);
+        float32x4_t vy0 = vld1q_f32(y + i);
+        float32x4_t vx1 = vld1q_f32(x + i + 4);
+        float32x4_t vy1 = vld1q_f32(y + i + 4);
+        sum0 = vmlaq_f32(sum0, vx0, vy0);  // sum0 += vx0 * vy0
+        sum1 = vmlaq_f32(sum1, vx1, vy1);  // sum1 += vx1 * vy1
+    }
+    // Horizontal sum
+    float tmp0[4], tmp1[4];
+    vst1q_f32(tmp0, sum0);
+    vst1q_f32(tmp1, sum1);
+    float result = tmp0[0] + tmp0[1] + tmp0[2] + tmp0[3] +
+                   tmp1[0] + tmp1[1] + tmp1[2] + tmp1[3];
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        result += x[i] * y[i];
+    }
+    return result;
+}
+
+// NEON fused multiply-add
+static inline void ggml_vec_mad_neon(float * GGML_RESTRICT dst, const float * GGML_RESTRICT src, float alpha, int n) {
+    float32x4_t valpha = vdupq_n_f32(alpha);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t vsrc = vld1q_f32(src + i);
+        float32x4_t vdst = vld1q_f32(dst + i);
+        float32x4_t valpha_vsrc = vmulq_f32(valpha, vsrc);
+        vdst = vaddq_f32(vdst, valpha_vsrc);
+        vst1q_f32(dst + i, vdst);
+    }
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        dst[i] += alpha * src[i];
+    }
+}
+
+// NEON incremental softmax: find max
+static inline float ggml_reduce_max_neon(const float * x, int n) {
+    if (n == 0) return -INFINITY;
+    float32x4_t vmax = vdupq_n_f32(x[0]);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        vmax = vmaxq_f32(vmax, vx);
+    }
+    // Horizontal max
+    float tmp[4];
+    vst1q_f32(tmp, vmax);
+    float result = tmp[0];
+    for (int j = 1; j < 4; ++j) {
+        result = result > tmp[j] ? result : tmp[j];
+    }
+    // Handle remaining elements
+    for (; i < n; ++i) {
+        result = result > x[i] ? result : x[i];
+    }
+    return result;
+}
+
+#define GGML_USE_SIMD_DOT_PRODUCT 1
+#define GGML_USE_SIMD_MAD 1
+#define GGML_USE_SIMD_REDUCE_MAX 1
+
+#else
+// Scalar fallbacks
+#define GGML_USE_SIMD_DOT_PRODUCT 0
+#define GGML_USE_SIMD_MAD 0
+#define GGML_USE_SIMD_REDUCE_MAX 0
+#endif
+
+// ============================================================================
+// ggml_compute_forward_paged_attention
+// ============================================================================
+
+// Helper: incremental softmax computation (SIMD-optimized)
+// This allows computing softmax incrementally across multiple blocks
+// which is essential for PagedAttention
+static void ggml_incremental_softmax_f32(
+        const float * scores,
+        float * output,
+        float * old_max,
+        float * old_sum_exp,
+        int n) {
+    // Find max in current block (use SIMD if available)
+#if defined(__AVX2__)
+    float block_max = ggml_reduce_max_avx2(scores, n);
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    float block_max = ggml_reduce_max_neon(scores, n);
+#else
+    float block_max = scores[0];
+    for (int i = 1; i < n; i++) {
+        if (scores[i] > block_max) {
+            block_max = scores[i];
+        }
+    }
+#endif
+
+    // Update global max
+    float new_max = fmaxf(*old_max, block_max);
+
+    // Renormalize old sum_exp if max changed
+    float sum_exp = *old_sum_exp;
+    if (new_max > *old_max) {
+        sum_exp *= expf(*old_max - new_max);
+    }
+
+    // Add new block's contribution
+    int i = 0;
+#if defined(__AVX2__)
+    {
+        __m256 vnew_max = _mm256_set1_ps(new_max);
+        for (; i + 8 <= n; i += 8) {
+            __m256 vscores = _mm256_loadu_ps(scores + i);
+            __m256 vdiff = _mm256_sub_ps(vscores, vnew_max);
+            // Compute exp for each element
+            float tmp[8];
+            _mm256_storeu_ps(tmp, vdiff);
+            for (int j = 0; j < 8; ++j) {
+                tmp[j] = expf(tmp[j]);
+            }
+            _mm256_storeu_ps(output + i, _mm256_loadu_ps(tmp));
+        }
+    }
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t vscores = vld1q_f32(scores + i);
+        float32x4_t vdiff = vsubq_f32(vscores, vdupq_n_f32(new_max));
+        float tmp[4];
+        vst1q_f32(tmp, vdiff);
+        for (int j = 0; j < 4; ++j) {
+            tmp[j] = expf(tmp[j]);
+        }
+        vst1q_f32(output + i, vld1q_f32(tmp));
+    }
+#endif
+
+    // Handle remaining elements and accumulate sum_exp
+    for (; i < n; ++i) {
+        float exp_score = expf(scores[i] - new_max);
+        output[i] = exp_score;
+        sum_exp += exp_score;
+    }
+
+    // Sum exp values from SIMD-processed elements
+#if defined(__AVX2__)
+    for (int j = 0; j < i; j += 8) {
+        for (int k = 0; k < 8 && j + k < i; ++k) {
+            sum_exp += output[j + k];
+        }
+    }
+#endif
+
+    // Normalize
+    float inv_sum = 1.0f / sum_exp;
+    i = 0;
+#if defined(__AVX2__)
+    {
+        __m256 vinv_sum = _mm256_set1_ps(inv_sum);
+        for (; i + 8 <= n; i += 8) {
+            __m256 vout = _mm256_loadu_ps(output + i);
+            vout = _mm256_mul_ps(vout, vinv_sum);
+            _mm256_storeu_ps(output + i, vout);
+        }
+    }
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    {
+        float32x4_t vinv_sum = vdupq_n_f32(inv_sum);
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t vout = vld1q_f32(output + i);
+            vout = vmulq_f32(vout, vinv_sum);
+            vst1q_f32(output + i, vout);
+        }
+    }
+#endif
+    for (; i < n; ++i) {
+        output[i] *= inv_sum;
+    }
+
+    *old_max = new_max;
+    *old_sum_exp = sum_exp;
+}
+
+static void ggml_compute_forward_paged_attention_one_chunk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int ir0, int ir1) {
+
+    const ggml_tensor * q           = dst->src[0];
+    const ggml_tensor * k           = dst->src[1];
+    const ggml_tensor * v           = dst->src[2];
+    const ggml_tensor * mask        = dst->src[3];
+    const ggml_tensor * block_tables = dst->src[4];
+    const ggml_tensor * seq_lengths  = dst->src[5];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+
+    // K,V layout: [head_dim, num_kv_heads, block_size, num_blocks]
+    //  ne[0]=head_dim, ne[1]=num_kv_heads, ne[2]=block_size, ne[3]=num_blocks
+    const int64_t num_kv_heads = nek1;
+
+    // Get parameters
+    const float scale = dst->op_params[0];
+    const int block_size = (int)dst->op_params[1];
+
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne2 == neq1);
+
+    // block_tables shape: [max_blocks_per_seq, batch_size] (int32)
+    const int32_t * block_tables_data = (const int32_t *)block_tables->data;
+    const int32_t max_blocks_per_seq = block_tables->ne[0];
+    const int32_t * seq_lengths_data  = (const int32_t *)seq_lengths->data;
+
+    // Process each query in the chunk
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int iq1 = ir % neq1; // token index in sequence (0 for decode)
+        const int iq2 = ir / neq1; // head index (Q head)
+        const int iq3 = ir / (neq1*neq2); // batch index
+
+        const int seq_len = seq_lengths_data[iq3];
+
+        // GQA: map Q head to KV head
+        const int kv_head = (int)((int64_t)iq2 * num_kv_heads / neq2);
+
+        // Get query vector
+        const float * q_data = (const float *) ((const char *) q->data + iq1*nbq1 + iq2*nbq2 + iq3*nbq3);
+
+        // Output buffer for this query
+        float * dst_data = (float *) ((char *) dst->data + ir*nb1);
+
+        // Initialize output
+        for (int dv = 0; dv < DV; ++dv) {
+            dst_data[dv] = 0.0f;
+        }
+
+        // Incremental softmax state
+        float softmax_max = -INFINITY;
+        float softmax_sum_exp = 0.0f;
+
+        // Process blocks for this sequence
+        const int num_blocks = (seq_len + block_size - 1) / block_size;
+
+        for (int block_idx = 0; block_idx < num_blocks; ++block_idx) {
+            // Get physical block ID from block table:
+            // block_tables is [max_blocks_per_seq, batch_size], ne[0]=max_blocks_per_seq
+            const int physical_block = block_tables_data[iq3 * max_blocks_per_seq + block_idx];
+
+            // Skip invalid blocks (physical_block < 0 means no block allocated)
+            if (physical_block < 0) {
+                continue;
+            }
+
+            // Calculate range within this block
+            const int block_start = block_idx * block_size;
+            const int block_end   = MIN(block_start + block_size, seq_len);
+
+            // Skip if this block is entirely before the current position
+            if (block_end <= iq1) {
+                continue;
+            }
+
+            // Positions in this block we attend to (with causal masking)
+            const int kv_start = MAX(block_start, 0);
+            const int kv_end   = MIN(block_end, iq1 + 1);
+            const int kv_len   = kv_end - kv_start;
+
+            if (kv_len <= 0) {
+                continue;
+            }
+
+            float * block_scores = (float *) alloca(sizeof(float) * kv_len);
+
+            for (int ik = 0; ik < kv_len; ++ik) {
+                // ik is the offset within kv_start..kv_end
+                // We need the position within the physical block:
+                //   block_offset = (block_start + ik) % block_size = ik
+                //   since block_start = block_idx * block_size and ik < block_size
+                const int block_offset = ik;
+
+                // Access K: k[block_offset, kv_head, physical_block]
+                const float * k_data = (const float *) ((const char *) k->data +
+                    block_offset * nbk2 +      // position within block (dim 2 stride)
+                    kv_head * nbk1 +           // head index (dim 1 stride)
+                    physical_block * nbk3);    // block index (dim 3 stride)
+
+                // Dot product (SIMD-optimized)
+#if defined(__AVX2__)
+                float sum = ggml_dot_product_avx2(q_data, k_data, DK) * scale;
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+                float sum = ggml_dot_product_neon(q_data, k_data, DK) * scale;
+#else
+                float sum = 0.0f;
+                for (int dk = 0; dk < DK; ++dk) {
+                    sum += q_data[dk] * k_data[dk];
+                }
+                sum *= scale;
+#endif
+                block_scores[ik] = sum;
+            }
+
+            // Apply mask if provided
+            if (mask) {
+                for (int ik = 0; ik < kv_len; ++ik) {
+                    const int seq_pos = kv_start + ik;
+                    const float * mask_data = (const float *) ((const char *) mask->data +
+                        iq1 * mask->nb[1] +
+                        iq2 * mask->nb[2] +
+                        iq3 * mask->nb[3]);
+                    block_scores[ik] += mask_data[seq_pos];
+                }
+            }
+
+            // Incremental softmax
+            float * attn_weights = (float *) alloca(sizeof(float) * kv_len);
+            ggml_incremental_softmax_f32(block_scores, attn_weights,
+                &softmax_max, &softmax_sum_exp, kv_len);
+
+            // Accumulate weighted values (SIMD-optimized)
+            for (int ik = 0; ik < kv_len; ++ik) {
+                const int block_offset = ik; // position within physical block
+                const float weight = attn_weights[ik];
+
+                const float * v_data = (const float *) ((const char *) v->data +
+                    block_offset * nbv2 +
+                    kv_head * nbv1 +
+                    physical_block * nbv3);
+
+#if defined(__AVX2__)
+                ggml_vec_mad_avx2(dst_data, v_data, weight, DV);
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+                ggml_vec_mad_neon(dst_data, v_data, weight, DV);
+#else
+                for (int dv = 0; dv < DV; ++dv) {
+                    dst_data[dv] += weight * v_data[dv];
+                }
+#endif
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_paged_attention_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t N  = neq1;
+
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne2 == N);
+
+    // input tensor rows must be contiguous
+    GGML_ASSERT(nbq0 == ggml_type_size(q->type));
+    GGML_ASSERT(nbk0 == ggml_type_size(k->type));
+    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+
+    GGML_ASSERT(neq0 == DK);
+    GGML_ASSERT(nek0 == DK);
+    GGML_ASSERT(nev0 == DV);
+
+    // dst cannot be transposed or permuted
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    // parallelize by q rows
+    const int64_t nr = neq1*neq2*neq3;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const bool disable_chunking = ggml_is_numa();
+
+    int nth_scaled = nth * 4;
+    int64_t chunk_size = (nr + nth_scaled - 1) / nth_scaled;
+    int64_t nchunk     = (nr + chunk_size - 1) / chunk_size;
+
+    if (nth == 1 || nchunk < nth || disable_chunking) {
+        nchunk = nth;
+    }
+
+    if (ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    const int64_t dr = (nr + nchunk - 1) / nchunk;
+
+    int current_chunk = ith;
+
+    while (current_chunk < nchunk) {
+        const int64_t ir0 = dr * current_chunk;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+
+        ggml_compute_forward_paged_attention_one_chunk(params, dst, ir0, ir1);
+
+        current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+    }
+}
+
+void ggml_compute_forward_paged_attention(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_paged_attention_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_ssm_conv
 
 static void ggml_compute_forward_ssm_conv_f32(

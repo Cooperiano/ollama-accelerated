@@ -1,0 +1,54 @@
+[
+  {
+    "Label": "official",
+    "Concurrency": 4,
+    "TotalRequests": 20,
+    "SuccessCount": 20,
+    "FailureCount": 0,
+    "TotalTime": 37199082613,
+    "AvgLatency": 7029633436,
+    "MinLatency": 1655032304,
+    "MaxLatency": 10519424644,
+    "ThroughputTPS": 88.36239415353992,
+    "AvgTokensPerReq": 164.35
+  },
+  {
+    "Label": "official",
+    "Concurrency": 8,
+    "TotalRequests": 40,
+    "SuccessCount": 40,
+    "FailureCount": 0,
+    "TotalTime": 75244756514,
+    "AvgLatency": 13734952796,
+    "MinLatency": 2034060777,
+    "MaxLatency": 17492530901,
+    "ThroughputTPS": 90.0660765476605,
+    "AvgTokensPerReq": 169.425
+  },
+  {
+    "Label": "official",
+    "Concurrency": 16,
+    "TotalRequests": 80,
+    "SuccessCount": 80,
+    "FailureCount": 0,
+    "TotalTime": 150770546428,
+    "AvgLatency": 27170632225,
+    "MinLatency": 2619847092,
+    "MaxLatency": 33762770312,
+    "ThroughputTPS": 90.3359463945711,
+    "AvgTokensPerReq": 170.25
+  },
+  {
+    "Label": "official",
+    "Concurrency": 32,
+    "TotalRequests": 160,
+    "SuccessCount": 160,
+    "FailureCount": 0,
+    "TotalTime": 288662672488,
+    "AvgLatency": 51943817431,
+    "MinLatency": 2055144520,
+    "MaxLatency": 60998589736,
+    "ThroughputTPS": 90.33381342744967,
+    "AvgTokensPerReq": 162.975
+  }
+]

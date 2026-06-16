@@ -1,0 +1,9 @@
+{
+  "Label": "official",
+  "SingleLatency": 3181958528,
+  "SingleTokens": 92,
+  "SingleTPS": 28.913010396092755,
+  "ConcurrentTotalTime": 10273020658,
+  "ConcurrentAvgTime": 1027302065,
+  "ConcurrentTPS": 90.23636093616818
+}

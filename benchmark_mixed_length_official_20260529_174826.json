@@ -1,0 +1,17 @@
+{
+  "Label": "official",
+  "TotalRequests": 60,
+  "SuccessCount": 60,
+  "FailureCount": 0,
+  "TotalTime": 255839521123,
+  "ShortCount": 30,
+  "ShortAvgTokens": 230.26666666666668,
+  "ShortAvgLatency": 29911603910,
+  "MediumCount": 20,
+  "MediumAvgTokens": 410.9,
+  "MediumAvgLatency": 32023429728,
+  "LongCount": 10,
+  "LongAvgTokens": 561.3,
+  "LongAvgLatency": 35344327374,
+  "OverallThroughput": 81.06253447069778
+}
